@@ -1,0 +1,159 @@
+# Place this file in the central repo at: .github/workflows/jira-sync.yml
+#
+# Syncs issues from ALL repositories in the organization to Jira:
+#  - open issues without the "jira-tracked" label -> Jira task + comment + label
+#  - recently closed issues with the label         -> Jira item moved to Done
+#
+# Requirements (see setup notes):
+#  - GitHub App installed on all org repos, permission "Issues: Read and write"
+#  - repo variable JIRA_SYNC_APP_ID, repo secret JIRA_SYNC_APP_PRIVATE_KEY
+#  - secrets JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN (org or repo level)
+
+name: Sync GitHub issues to Jira
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:          # allows manual start from the Actions tab
+
+concurrency:
+  group: jira-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get GitHub App token for the whole organization
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.JIRA_SYNC_APP_ID }}
+          private-key: ${{ secrets.JIRA_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Sync issues with Jira
+        uses: actions/github-script@v7
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_PROJECT: QSI
+          JIRA_ISSUE_TYPE: Task
+          TRACKED_LABEL: jira-tracked
+          CLOSED_LOOKBACK_DAYS: "2"
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const org = context.repo.owner;
+            const label = process.env.TRACKED_LABEL;
+            const base = process.env.JIRA_BASE_URL.replace(/\/+$/, '');
+            const auth = 'Basic ' + Buffer.from(
+              `${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`
+            ).toString('base64');
+            const keyRe = /Tracked in Jira: \[([A-Z][A-Z0-9]+-\d+)\]/;
+
+            // ---------- helpers ----------
+            async function jira(method, path, body) {
+              const res = await fetch(`${base}/rest/api/2${path}`, {
+                method,
+                headers: {
+                  Authorization: auth,
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                },
+                body: body ? JSON.stringify(body) : undefined,
+              });
+              const text = await res.text();
+              if (!res.ok) throw new Error(`Jira ${method} ${path}: ${res.status} ${text}`);
+              return text ? JSON.parse(text) : {};
+            }
+
+            function repoOf(issue) {
+              // repository_url looks like https://api.github.com/repos/{owner}/{repo}
+              const [owner, repo] = issue.repository_url.split('/').slice(-2);
+              return { owner, repo };
+            }
+
+            async function findJiraKey(owner, repo, issue_number) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              for (const c of comments) {
+                const m = (c.body || '').match(keyRe);
+                if (m) return m[1];
+              }
+              return null;
+            }
+
+            async function search(q) {
+              core.info(`Search: ${q}`);
+              return github.paginate(github.rest.search.issuesAndPullRequests, { q, per_page: 100 });
+            }
+
+            // ---------- 1) open issues -> create Jira tasks ----------
+            const open = await search(`org:${org} is:issue is:open archived:false -label:${label}`);
+            core.info(`Open issues without label "${label}": ${open.length}`);
+
+            for (const issue of open) {
+              const { owner, repo } = repoOf(issue);
+              const ref = `${owner}/${repo}#${issue.number}`;
+              try {
+                let key = await findJiraKey(owner, repo, issue.number);
+                if (key) {
+                  core.info(`${ref} already linked to ${key}, adding label only`);
+                } else {
+                  const created = await jira('POST', '/issue', {
+                    fields: {
+                      project: { key: process.env.JIRA_PROJECT },
+                      issuetype: { name: process.env.JIRA_ISSUE_TYPE },
+                      summary: `[${repo}] ${issue.title}`.slice(0, 255),
+                      description:
+                        `GitHub Issue: ${issue.html_url}\n` +
+                        `Author: ${issue.user.login}\n\n` +
+                        (issue.body || ''),
+                    },
+                  });
+                  key = created.key;
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issue.number,
+                    body: `Tracked in Jira: [${key}](${base}/browse/${key})`,
+                  });
+                  core.info(`${ref} -> ${key} created`);
+                }
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: issue.number, labels: [label],
+                });
+              } catch (e) {
+                core.warning(`${ref}: ${e.message}`);
+              }
+            }
+
+            // ---------- 2) recently closed issues -> move Jira items to Done ----------
+            const days = Number(process.env.CLOSED_LOOKBACK_DAYS);
+            const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+            const closed = await search(`org:${org} is:issue is:closed label:${label} closed:>=${since}`);
+            core.info(`Closed tracked issues since ${since}: ${closed.length}`);
+
+            for (const issue of closed) {
+              const { owner, repo } = repoOf(issue);
+              const ref = `${owner}/${repo}#${issue.number}`;
+              try {
+                const key = await findJiraKey(owner, repo, issue.number);
+                if (!key) { core.info(`${ref}: no Jira key found, skipping`); continue; }
+
+                const { fields } = await jira('GET', `/issue/${key}?fields=status`);
+                if (fields.status.statusCategory.key === 'done') continue;
+
+                const { transitions } = await jira('GET', `/issue/${key}/transitions`);
+                const done = transitions.find(t =>
+                  t.name.toLowerCase() === 'done' ||
+                  (t.to && t.to.name && t.to.name.toLowerCase() === 'done'));
+                if (!done) { core.warning(`${key}: no "Done" transition available`); continue; }
+
+                await jira('POST', `/issue/${key}/transitions`, { transition: { id: done.id } });
+                core.info(`${ref} -> ${key} moved to Done`);
+              } catch (e) {
+                core.warning(`${ref}: ${e.message}`);
+              }
+            }
