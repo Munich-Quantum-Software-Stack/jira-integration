@@ -13,7 +13,7 @@ name: Sync GitHub issues to Jira
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
+    - cron: "*/1 * * * *"   # every 30 minutes
   workflow_dispatch:          # allows manual start from the Actions tab
 
 concurrency:
