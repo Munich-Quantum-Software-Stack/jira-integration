@@ -1,20 +1,37 @@
 # Place this file in the central repo at: .github/workflows/jira-sync.yml
 #
 # Syncs issues from ALL repositories in the organization to Jira:
-#  - open issues without the "jira-tracked" label -> Jira task + comment + label
+#  - open issues without the "jira-tracked" label -> label + Jira task + comment
 #  - recently closed issues with the label         -> Jira item moved to Done
 #
-# Requirements (see setup notes):
+# Requirements:
 #  - GitHub App installed on all org repos, permission "Issues: Read and write"
 #  - repo variable JIRA_SYNC_APP_ID, repo secret JIRA_SYNC_APP_PRIVATE_KEY
 #  - secrets JIRA_BASE_URL, JIRA_USER_EMAIL, JIRA_API_TOKEN (org or repo level)
+#
+# Safety:
+#  - Manual runs are a dry run by default (nothing is changed, only logged).
+#  - Manual runs can be limited to one repository.
+#  - At most MAX_NEW_PER_RUN new Jira tickets per run.
+#  - Order "label -> Jira ticket -> comment" prevents duplicate tickets.
 
 name: Sync GitHub issues to Jira
 
 on:
-  schedule:
-    - cron: "*/1 * * * *"   # every 30 minutes
-  workflow_dispatch:          # allows manual start from the Actions tab
+  # The schedule is switched off until testing is done.
+  # After testing, remove the "#" in front of the next two lines.
+  # schedule:
+  #   - cron: "*/30 * * * *"   # every 30 minutes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: only log what would happen, change nothing"
+        type: boolean
+        default: true
+      repo:
+        description: "Optional: only this repository (name only, e.g. MQSS-Benchmarking-Framework). Empty = all repositories"
+        type: string
+        default: ""
 
 concurrency:
   group: jira-sync
@@ -42,16 +59,40 @@ jobs:
           JIRA_ISSUE_TYPE: Task
           TRACKED_LABEL: jira-tracked
           CLOSED_LOOKBACK_DAYS: "2"
+          MAX_NEW_PER_RUN: "20"
+          # Scheduled runs have no inputs -> real run, all repositories.
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          REPO_FILTER: ${{ inputs.repo }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            // ---------- settings and checks ----------
+            for (const name of ['JIRA_BASE_URL', 'JIRA_USER_EMAIL', 'JIRA_API_TOKEN']) {
+              if (!process.env[name]) {
+                core.setFailed(`Secret ${name} is not available to this repository. Check its "Repository access".`);
+                return;
+              }
+            }
+
             const org = context.repo.owner;
             const label = process.env.TRACKED_LABEL;
+            const dryRun = process.env.DRY_RUN === 'true';
+            const maxNew = Number(process.env.MAX_NEW_PER_RUN);
+            const repoName = (process.env.REPO_FILTER || '').trim();
+            if (repoName && !/^[A-Za-z0-9._-]+$/.test(repoName)) {
+              core.setFailed(`Invalid repository name: ${repoName}`);
+              return;
+            }
+            const scope = repoName ? `repo:${org}/${repoName}` : `org:${org}`;
+
             const base = process.env.JIRA_BASE_URL.replace(/\/+$/, '');
             const auth = 'Basic ' + Buffer.from(
               `${process.env.JIRA_USER_EMAIL}:${process.env.JIRA_API_TOKEN}`
             ).toString('base64');
             const keyRe = /Tracked in Jira: \[([A-Z][A-Z0-9]+-\d+)\]/;
+
+            if (dryRun) core.notice('DRY RUN: nothing will be changed in GitHub or Jira.');
+            core.info(`Scope: ${scope}`);
 
             // ---------- helpers ----------
             async function jira(method, path, body) {
@@ -75,11 +116,19 @@ jobs:
               return { owner, repo };
             }
 
+            // Only accept "Tracked in Jira" comments from bots and from
+            // organization owners, members and collaborators.
+            const TRUSTED = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+            function isTrusted(c) {
+              return (c.user && c.user.type === 'Bot') || TRUSTED.includes(c.author_association);
+            }
+
             async function findJiraKey(owner, repo, issue_number) {
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number, per_page: 100,
               });
               for (const c of comments) {
+                if (!isTrusted(c)) continue;
                 const m = (c.body || '').match(keyRe);
                 if (m) return m[1];
               }
@@ -92,47 +141,91 @@ jobs:
             }
 
             // ---------- 1) open issues -> create Jira tasks ----------
-            const open = await search(`org:${org} is:issue is:open archived:false -label:${label}`);
+            const open = await search(`${scope} is:issue is:open archived:false -label:${label}`);
             core.info(`Open issues without label "${label}": ${open.length}`);
 
+            let attempted = 0;
             for (const issue of open) {
               const { owner, repo } = repoOf(issue);
               const ref = `${owner}/${repo}#${issue.number}`;
+
+              let key;
               try {
-                let key = await findJiraKey(owner, repo, issue.number);
-                if (key) {
-                  core.info(`${ref} already linked to ${key}, adding label only`);
-                } else {
-                  const created = await jira('POST', '/issue', {
-                    fields: {
-                      project: { key: process.env.JIRA_PROJECT },
-                      issuetype: { name: process.env.JIRA_ISSUE_TYPE },
-                      summary: `[${repo}] ${issue.title}`.slice(0, 255),
-                      description:
-                        `GitHub Issue: ${issue.html_url}\n` +
-                        `Author: ${issue.user.login}\n\n` +
-                        (issue.body || ''),
-                    },
-                  });
-                  key = created.key;
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: issue.number,
-                    body: `Tracked in Jira: [${key}](${base}/browse/${key})`,
-                  });
-                  core.info(`${ref} -> ${key} created`);
-                }
-                await github.rest.issues.addLabels({
-                  owner, repo, issue_number: issue.number, labels: [label],
-                });
+                key = await findJiraKey(owner, repo, issue.number);
               } catch (e) {
-                core.warning(`${ref}: ${e.message}`);
+                core.warning(`${ref}: could not read comments, skipped: ${e.message}`);
+                continue;
+              }
+
+              // Already linked (for example by the old per-repo workflow): only add the label.
+              if (key) {
+                if (dryRun) { core.info(`[dry run] ${ref} already linked to ${key}, would add label`); continue; }
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: [label] });
+                  core.info(`${ref} already linked to ${key}, label added`);
+                } catch (e) {
+                  core.warning(`${ref}: could not add label: ${e.message}`);
+                }
+                continue;
+              }
+
+              if (attempted >= maxNew) {
+                core.warning(`Limit of ${maxNew} new Jira tickets per run reached. The remaining issues follow in the next run.`);
+                break;
+              }
+              attempted++;
+
+              if (dryRun) {
+                core.info(`[dry run] would create Jira ticket for ${ref}: ${issue.title}`);
+                continue;
+              }
+
+              // Step 1: label first. If this fails, nothing is created.
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number: issue.number, labels: [label] });
+              } catch (e) {
+                core.warning(`${ref}: could not add label, skipped (nothing created): ${e.message}`);
+                continue;
+              }
+
+              // Step 2: create the Jira ticket. If this fails, remove the label so the next run retries.
+              try {
+                const created = await jira('POST', '/issue', {
+                  fields: {
+                    project: { key: process.env.JIRA_PROJECT },
+                    issuetype: { name: process.env.JIRA_ISSUE_TYPE },
+                    summary: `[${repo}] ${issue.title}`.slice(0, 255),
+                    description:
+                      `GitHub Issue: ${issue.html_url}\n` +
+                      `Author: ${issue.user.login}\n\n` +
+                      (issue.body || ''),
+                  },
+                });
+                key = created.key;
+              } catch (e) {
+                core.warning(`${ref}: Jira ticket could not be created: ${e.message}`);
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: issue.number, name: label });
+                } catch (e2) {
+                  core.warning(`${ref}: could not remove label again: ${e2.message}`);
+                }
+                continue;
+              }
+
+              // Step 3: comment with the Jira link. If this fails, the label stays, so no duplicate is created.
+              const linkText = `Tracked in Jira: [${key}](${base}/browse/${key})`;
+              try {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body: linkText });
+                core.info(`${ref} -> ${key} created`);
+              } catch (e) {
+                core.warning(`${ref}: Jira ticket ${key} was created, but the GitHub comment failed. Add this comment by hand: ${linkText} (Error: ${e.message})`);
               }
             }
 
             // ---------- 2) recently closed issues -> move Jira items to Done ----------
             const days = Number(process.env.CLOSED_LOOKBACK_DAYS);
             const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-            const closed = await search(`org:${org} is:issue is:closed label:${label} closed:>=${since}`);
+            const closed = await search(`${scope} is:issue is:closed label:${label} closed:>=${since}`);
             core.info(`Closed tracked issues since ${since}: ${closed.length}`);
 
             for (const issue of closed) {
@@ -144,6 +237,8 @@ jobs:
 
                 const { fields } = await jira('GET', `/issue/${key}?fields=status`);
                 if (fields.status.statusCategory.key === 'done') continue;
+
+                if (dryRun) { core.info(`[dry run] would move ${key} to Done (${ref} is closed)`); continue; }
 
                 const { transitions } = await jira('GET', `/issue/${key}/transitions`);
                 const done = transitions.find(t =>
